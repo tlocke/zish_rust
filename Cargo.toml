@@ -1,11 +1,17 @@
 [package]
-name = "zish_rust"
+name = "zish"
 version = "0.1.0"
 authors = ["Tony Locke <tlocke@tlocke.org.uk>"]
 edition = "2018"
+license = "Unlicense"
+description = "A Rust implementation of the Zish data serialization format."
+homepage = "https://github.com/tlocke/zish_rust"
+readme = "README.adoc"
+documentation = "https://docs.rs/zish"
+repository = "https://github.com/tlocke/zish_rust"
 
 [dependencies]
-base64 = "0.10.1"
-regex = "1.1.2"
-chrono = "0.4.6"
-bigdecimal = "0.0.15"
+base64 = "0.13.0"
+regex = "1.4.5"
+chrono = "0.4.19"
+bigdecimal = "0.2.0"

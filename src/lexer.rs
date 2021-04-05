@@ -362,7 +362,7 @@ fn lex_comment(c: Option<char>, state: &mut State) -> Result<Option<Token>, Zish
             "Reached the end of the document without the comment being closed with a '*/'"
                 .to_string(),
         )),
-        (Some('/'), Some('*'), 0...2) => Err(ZishError::Location(
+        (Some('/'), Some('*'), 0..=2) => Err(ZishError::Location(
             "You can't have a comment that's '/*/', an empty comment is '/**/'.".to_string(),
             state.location,
         )),
@@ -415,7 +415,7 @@ fn unescape(escaped_str: &str, location: Location) -> Result<String, ZishError> 
                 }
             }
 
-            for (prefix, digits) in [("x", 2), ("u", 4), ("U", 8)].into_iter() {
+            for (prefix, digits) in [("x", 2), ("u", 4), ("U", 8)].iter() {
                 if tail_str.starts_with(prefix) {
                     let hex_str: &str = &tail_str[1..1 + *digits];
                     let i: u32 = match u32::from_str_radix(hex_str, 16) {
@@ -440,8 +440,7 @@ fn unescape(escaped_str: &str, location: Location) -> Result<String, ZishError> 
             }
 
             Err(ZishError::Description(format!(
-                "Can't find a valid string following the first backslash \
-                 of '{}'.",
+                "Can't find a valid string following the first backslash of '{}'.",
                 escaped_str
             )))
         }
@@ -615,6 +614,55 @@ mod tests {
             Token::Finish,
         ];
         match lex("[ \"first\" ]") {
+            Ok(res) => assert_eq!(res, expected),
+            Err(e) => panic!("{:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_lex_map() {
+        let expected: Vec<Token> = vec![
+            Token::StartMap(Location {
+                line: 1,
+                character: 1,
+            }),
+            Token::Primitive(
+                Location {
+                    line: 1,
+                    character: 5,
+                },
+                PrimitiveValue::String("x".to_string()),
+            ),
+            Token::Colon(Location {
+                line: 1,
+                character: 6,
+            }),
+            Token::StartList(Location {
+                line: 1,
+                character: 8,
+            }),
+            Token::Primitive(
+                Location {
+                    line: 1,
+                    character: 16,
+                },
+                PrimitiveValue::String("first".to_string()),
+            ),
+            Token::FinishList(Location {
+                line: 1,
+                character: 18,
+            }),
+            Token::Comma(Location {
+                line: 1,
+                character: 19,
+            }),
+            Token::FinishMap(Location {
+                line: 1,
+                character: 21,
+            }),
+            Token::Finish,
+        ];
+        match lex("{ \"x\": [ \"first\" ], }") {
             Ok(res) => assert_eq!(res, expected),
             Err(e) => panic!("{:?}", e),
         }

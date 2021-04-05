@@ -1,3 +1,35 @@
+//! This crate is a Rust implementation of the [Zish] format.
+//!
+//! # Usage
+//!
+//! ```
+//! use std::str::FromStr;
+//! use zish::{Value};
+//!
+//! fn main() {
+//!     let s = "{
+//!  \"description\": null,
+//!  \"key\": 'a3NoaGdybA==',
+//!  \"number_of_novellas\": 5,
+//!  \"price\": 7.99,
+//!  \"read_date\": 2017-07-16T14:05:00Z,
+//!  \"tags\": [
+//!    \"russian\",
+//!    \"novel\",
+//!    \"19th centuary\",
+//!  ],
+//!  \"title\": \"A Hero of Our Time\",
+//!  \"weight\": 6.88,
+//!  \"would_recommend\": true,
+//! }";
+//!     let value: Value = Value::from_str(s).unwrap();
+//!
+//!     println!("zish str {}", value.to_string());
+//! }
+//! ```
+//!
+//! [Zish]: https://github.com/tlocke/zish
+
 extern crate base64;
 extern crate bigdecimal;
 extern crate chrono;
@@ -74,6 +106,554 @@ impl Value {
 
 }
 
+impl FromStr for Value {
+    type Err = ZishError;
+
+    fn from_str(zish_str: &str) -> Result<Self, Self::Err> {
+        let tokens = match lexer::lex(zish_str) {
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
+
+        let mut stack: Vec<Value> = Vec::new();
+        let mut state: State = State::Start;
+        let mut ret: Option<Value> = None;
+
+        for token in tokens.into_iter() {
+            println!("state {:?}", state);
+            println!("token {:?}\n", token);
+            match (state, token) {
+                (State::Start, Token::Finish) => {
+                    return Err(ZishError::Description(
+                        "There is no Zish value to parse.".to_string(),
+                    ));
+                }
+                (State::Start, Token::StartMap(_)) => {
+                    state = State::StartMap;
+                    stack.push(Value::Map(HashMap::new()));
+                }
+                (State::Start, Token::FinishMap(location)) => {
+                    return Err(ZishError::Location(
+                        "Found a '}', but there isn't an open map.".to_string(),
+                        location,
+                    ));
+                }
+                (State::Start, Token::Colon(location)) => {
+                    return Err(ZishError::Location(
+                        "Found a ':', but there isn't an open map.".to_string(),
+                        location,
+                    ));
+                }
+                (State::Start, Token::Comma(location)) => {
+                    return Err(ZishError::Location(
+                        "Found a ',', outside a list or map.".to_string(),
+                        location,
+                    ));
+                }
+                (State::Start, Token::StartList(_)) => {
+                    state = State::StartList;
+                    stack.push(Value::List(Vec::new()));
+                }
+                (State::Start, Token::FinishList(location)) => {
+                    return Err(ZishError::Location(
+                        "Found a ']', but there's no list to close.".to_string(),
+                        location,
+                    ));
+                }
+                (State::Start, Token::Primitive(_, x)) => {
+                    ret = Some(x.into_value());
+                    state = State::Value;
+                }
+
+                (State::Value, Token::StartMap(location)) => return Err(ZishError::Location(
+                        "Multiple top-level Zish values aren't allowed. So you can't have a value followed by a map.".to_string(),
+                        location,
+                    )),
+                (State::Value,  Token::FinishMap(location))
+                    => return Err(ZishError::Location(
+                    "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
+                    location,
+                )),
+                (State::Value,Token::Colon(location))
+                    => return Err(ZishError::Location(
+                    "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
+                    location,
+                )),
+               (State::Value, Token::Comma(location))
+                    => return Err(ZishError::Location(
+                    "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
+                    location,
+                )),
+                (State::Value,Token::StartList(location))
+                    => return Err(ZishError::Location(
+                    "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
+                    location,
+                )),
+                (State::Value,Token::FinishList(location))
+                    => return Err(ZishError::Location(
+                    "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
+                    location,
+                )),
+                (State::Value,Token::Primitive(location, _) )
+                    => return Err(ZishError::Location(
+                    "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
+                    location,
+                )),
+                (State::Value,Token::Finish) => (),
+
+                (State::StartMap, Token::Primitive(location, PrimitiveValue::Null)) => {
+                    return Err(ZishError::Location(
+                        "null can't be a key in a map.".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartMap, Token::Primitive(location, primitive_value)) => match stack.pop().unwrap() {
+                    Value::Map(map) => {
+                        let k: Value = primitive_value.into_value();
+                        if map.contains_key(&k.to_key().unwrap()) {
+                            return Err(ZishError::Location(format!("Duplicate map keys aren't allowed: {}.", k), location));
+                        }
+                        stack.push(Value::Map(map));
+                        stack.push(k);
+                        state = State::MapKey;
+                    }
+                    _ => panic!("Shouldn't happen."),
+                }
+                (State::StartMap, Token::StartList(location)) => {
+                    return Err(ZishError::Location(
+                        "A list can't be a key in a map.".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartMap, Token::StartMap(location)) => {
+                    return Err(ZishError::Location(
+                        "A map can't be a key in a map.".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartMap, Token::FinishMap(_)) => match stack.pop() {
+                    Some(Value::Map(map)) => match stack.pop() {
+                        None => {
+                            ret = Some(Value::Map(map));
+                            state = State::Value;
+                        }
+                        Some(Value::List(mut list)) => {
+                            list.push(Value::Map(HashMap::new()));
+                            stack.push(Value::List(list));
+                            state = State::ListValue;
+                        }
+                        Some(key) => match stack.pop().unwrap() {
+                            Value::Map(mut umap) => {
+                                umap.insert(key.to_key().unwrap(), Value::Map(map));
+                                stack.push(Value::Map(umap));
+                                state = State::MapValue;
+                            }
+                            _ => panic!("Should never happen."),
+                        }
+                    }
+                    _ => panic!("Should never happen."),
+                }
+                (State::StartMap, Token::Colon(location)) => {
+                    return Err(ZishError::Location(
+                        "A map key is expected here, but instead got a ':'".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartMap, Token::Comma(location)) => {
+                    return Err(ZishError::Location(
+                        "A map key is expected here, but instead got a ','".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartMap, Token::FinishList(location)) => {
+                    return Err(ZishError::Location(
+                        "A map key is expected here, but instead got a ']'".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartMap, Token::Finish) => {
+                    return Err(ZishError::Description(
+                        "Reached the end of the document before the map was closed.".to_string())
+                    );
+                }
+                (State::MapKey, Token::Colon(_)) => state = State::MapColon,
+                (State::MapKey, Token::FinishMap(location)) =>
+                    return Err(ZishError::Location(
+                        "A ':' is expected here, but instead found a '}'".to_string(),
+                        location,
+                    )),
+                (State::MapKey, Token::Comma(location)) =>
+                    return Err(ZishError::Location(
+                        "A ':' is expected here, but instead found a ','".to_string(),
+                        location,
+                    )),
+                (State::MapKey, Token::Primitive(location, _)) =>
+                    return Err(ZishError::Location(
+                        "A ':' is expected here, but instead found a value.".to_string(),
+                        location,
+                    )),
+                (State::MapKey, Token::StartList(location)) =>
+                    return Err(ZishError::Location(
+                        "A ':' is expected here, but instead found a '['.".to_string(),
+                        location,
+                    )),
+                (State::MapKey, Token::FinishList(location)) => 
+                    return Err(ZishError::Location(
+                        "A ':' is expected here, but got a ']' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapKey, Token::Finish) => 
+                    return Err(ZishError::Description(
+                        "After the key, a ':' was expected, but reached the end of the document instead.".to_string())),
+                (State::MapKey, Token::StartMap(location)) =>
+                    return Err(ZishError::Location(
+                        "A ':' is expected here, but got a '{' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapColon, Token::StartMap(_)) => { 
+                    stack.push(Value::Map(HashMap::new()));
+                    state = State::StartMap;
+                }
+                (State::MapColon, Token::FinishMap(location)) =>
+                    return Err(ZishError::Location(
+                        "A map value is expected here, but instead found a '}'".to_string(),
+                        location,
+                    )),
+                (State::MapColon, Token::Comma(location)) =>
+                    return Err(ZishError::Location(
+                        "A map value is expected here, but instead found a ','".to_string(),
+                        location,
+                    )),
+                (State::MapColon, Token::Colon(location)) =>
+                    return Err(ZishError::Location(
+                        "A map value is expected here, but instead found another ':'".to_string(),
+                        location,
+                    )),
+                (State::MapColon, Token::Primitive(location, primitive_value)) => {
+                    let k: Value = stack.pop().unwrap();
+                    match stack.pop().unwrap() {
+                        Value::Map(mut m) => {
+                            match m.insert(k.to_key().unwrap(), primitive_value.into_value()) {
+                                None => stack.push(Value::Map(m)),
+                                _ => return Err(ZishError::Location(format!("Duplicate map keys aren't allowed: {}", k), location)),
+                            }
+                        }
+                        _ => panic!("sh"),
+                    }
+                    state = State::MapValue;
+                }
+                (State::MapColon, Token::StartList(_)) =>  {
+                    stack.push(Value::List(Vec::new()));
+                    state = State::StartList;
+                }
+                (State::MapColon, Token::FinishList(location)) => 
+                    return Err(ZishError::Location(
+                        "A value is expected here, but got a ']' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapColon, Token::Finish) => 
+                    return Err(ZishError::Description(
+                        "A value is expected here, but reached the end of the document instead.".to_string()
+                    )),
+                (State::MapValue, Token::Primitive(location, _)) => 
+                    return Err(ZishError::Location(
+                        "A ',' or '}' is expected here, but got a value instead.".to_string(),
+                        location,
+                    )),
+                (State::MapValue, Token::StartMap(location)) => 
+                    return Err(ZishError::Location(
+                        "A ',' or '}' is expected here, but got a '{' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapValue, Token::FinishMap(_)) => match stack.pop().unwrap() {
+                    Value::Map(map) => match stack.pop() {
+                        None => {
+                            state = State::Value;
+                            ret = Some(Value::Map(map));
+                        }
+                        Some(Value::List(mut list)) => {
+                            list.push(Value::Map(map));
+                            state = State::ListValue;
+                        }
+                        Some(key) => match stack.pop().unwrap() {
+                            Value::Map(mut umap) => {
+                                umap.insert(key.to_key().unwrap(), Value::Map(map));
+                                stack.push(Value::Map(umap));
+                                state = State::MapValue;
+                            }
+                            _ => panic!("sh"),
+                        }
+                    }
+                    _ => panic!("{:?}", stack),
+                }
+                (State::MapValue, Token::Colon(location)) => 
+                    return Err(ZishError::Location(
+                        "A ',' or '}' is expected here, but got a ':' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapValue, Token::Comma(_)) => state = State::MapComma,
+                (State::MapValue, Token::StartList(location)) => 
+                    return Err(ZishError::Location(
+                        "A ',' or '}' is expected here, but got a '[' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapValue, Token::FinishList(location)) => 
+                    return Err(ZishError::Location(
+                        "A ',' or '}' is expected here, but got a ']' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapValue, Token::Finish) => 
+                    return Err(ZishError::Description(
+                        "A ',' or '}' is expected here, but reached the end of the document instead.".to_string(),
+                    )),
+                (State::MapComma, Token::Colon(location)) => 
+                    return Err(ZishError::Location(
+                        "A key is expected here, but got a ':' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapComma, Token::StartMap(location)) => 
+                    return Err(ZishError::Location(
+                        "A key is expected here, but got a '{' instead. A map can't be a key.".to_string(),
+                        location,
+                    )),
+                (State::MapComma, Token::FinishMap(_)) => match stack.pop().unwrap() {
+                    Value::Map(map) => match stack.pop() {
+                        None => {
+                            state = State::Value;
+                            ret = Some(Value::Map(map));
+                        }
+                        Some(Value::List(mut list)) => {
+                            list.push(Value::Map(map));
+                            state = State::ListValue;
+                        }
+                        Some(key) => match stack.pop().unwrap() {
+                            Value::Map(mut umap) => {
+                                umap.insert(key.to_key().unwrap(), Value::Map(map));
+                                stack.push(Value::Map(umap));
+                                state = State::MapValue;
+                            }
+                            _ => panic!("sh"),
+                        }
+                    }
+                    _ => panic!("{:?}", stack),
+                }
+                (State::MapComma, Token::Comma(location)) => 
+                    return Err(ZishError::Location(
+                        "A key is expected here, but got a ',' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapComma, Token::StartList(location)) => 
+                    return Err(ZishError::Location(
+                        "A key is expected here, but got a '[' instead. A list can't be a key.".to_string(),
+                        location,
+                    )),
+                (State::MapComma, Token::FinishList(location)) => 
+                    return Err(ZishError::Location(
+                        "A key is expected here, but got a ']' instead.".to_string(),
+                        location,
+                    )),
+                (State::MapComma, Token::Primitive(location, PrimitiveValue::Null)) => {
+                    return Err(ZishError::Location(
+                        "A null can't be used as a map key.".to_string(),
+                        location,
+                    ));
+                }
+                (State::MapComma, Token::Primitive(_, primitive_value)) => {
+                    stack.push(primitive_value.into_value());
+                    state = State::MapKey;
+                }
+                (State::MapComma, Token::Finish) => 
+                    return Err(ZishError::Description(
+                        "A key is expected here, but reached the end of the document instead.".to_string()
+                    )),
+                (State::StartList, Token::FinishList(_)) => match stack.pop().unwrap() {
+                    Value::List(list) => match stack.pop() {
+                        None => {
+                            ret = Some(Value::List(list));
+                            state = State::Value;
+                        }
+                        Some(Value::List(mut ulist)) => {
+                            ulist.push(Value::List(list));
+                            stack.push(Value::List(ulist));
+                            state = State::ListValue;
+                        }
+                        Some(key) => match stack.pop().unwrap() {
+                            Value::Map(mut map) => {
+                                map.insert(key.to_key().unwrap(), Value::List(list));
+                                stack.push(Value::Map(map));
+                                state = State::MapValue;
+                            }
+                            _ => panic!("sh"),
+                        }
+                    }
+                    _ => panic!("sh"),
+                }
+                (State::StartList, Token::Primitive(_, x)) => match stack.pop().unwrap() {
+                    Value::List(mut list) => {
+                        list.push(x.into_value());
+                        stack.push(Value::List(list));
+                        state = State::ListValue;
+                    }
+                    _ => panic!("expected a list here."),
+                }
+                (State::StartList, Token::StartList(_)) =>
+                    stack.push(Value::List(Vec::new())),
+                (State::StartList, Token::StartMap(_)) => {
+                        stack.push(Value::Map(HashMap::new()));
+                        state = State::StartMap;
+                }
+                (State::StartList, Token::FinishMap(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a value here, but got '}'.".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartList, Token::Colon(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a value here, but got ':'.".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartList, Token::Comma(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a value here, but got ','.".to_string(),
+                        location,
+                    ));
+                }
+                (State::StartList, Token::Finish) => {
+                    return Err(ZishError::Description(
+                        "The document finished before the list was closed.".to_string(),
+                    ));
+                }
+                (State::ListValue, Token::Finish) => {
+                    return Err(ZishError::Description(
+                                "Expected a ',' or a ']', but reached the end of the document instead."
+                                    .to_string()
+                            ));
+                }
+                (State::ListValue, Token::Comma(_))  => state = State::ListComma,
+                (State::ListValue, Token::FinishList(_) )=> match stack.pop().unwrap() {
+                    Value::List(list) => match stack.pop() {
+                        None => {
+                            ret = Some(Value::List(list));
+                            state = State::Value;
+                        }
+                        Some(Value::List(mut l)) => {
+                            l.push(Value::List(list));
+                            stack.push(Value::List(l));
+                        }
+                        Some(key) => match stack.pop().unwrap() {
+                            Value::Map(mut map) => {
+                                map.insert(key.to_key().unwrap(), Value::List(list));
+                                stack.push(Value::Map(map));
+                            }
+                            _ => panic!("sh"),
+                        }
+                    }
+                    _ => panic!("sh"),
+                }
+                (State::ListValue, Token::FinishMap(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a ',' or a ']' here, but got '}'".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListValue, Token::Colon(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a ',' or a ']' here, but got ':'".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListValue, Token::StartMap(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a ',' or a ']' here, but got '{'".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListValue, Token::StartList(location)) => {
+                    return Err(ZishError::Location(
+                        "Expected a ',' or a ']' here, but got '['".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListValue, Token::Primitive(location, _)) => {
+                    return Err(ZishError::Location(
+                        "Expected a ',' or a ']' here, but got a value.".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListComma, Token::StartMap(_))  => {
+                    let map: HashMap<Key, Value> = HashMap::new();
+                    stack.push(Value::Map(map)); 
+                    state = State::StartMap;
+                }
+                (State::ListComma, Token::FinishMap(location))  => {
+                    return Err(ZishError::Location(
+                        "Expected a value here, but found a '}'.".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListComma, Token::Colon(location))  => {
+                    return Err(ZishError::Location(
+                        "Expected a value here, but found a ':'.".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListComma, Token::Comma(location))  => {
+                    return Err(ZishError::Location(
+                        "Expected a value here, but got a ','.".to_string(),
+                        location,
+                    ));
+                }
+                (State::ListComma, Token::StartList(_))  => {
+                    let list: Vec<Value> = Vec::new();
+                    stack.push(Value::List(list)); 
+                    state = State::StartList;
+                }
+                (State::ListComma, Token::Primitive(_, val))  => match stack.pop().unwrap() {
+                    Value::List(mut list) => {
+                        list.push(val.into_value());
+                        stack.push(Value::List(list));
+                        state = State::ListValue;
+                    }
+                    _ => panic!("expected a list here."),
+                }
+                (State::ListComma, Token::Finish)  => {
+                    return Err(ZishError::Description(
+                        "Expected a value, but reached the end of the document.".to_string())
+                    );
+                }
+                (State::ListComma, Token::FinishList(_) )=> match stack.pop().unwrap() {
+                    Value::List(list) => match stack.pop() {
+                        None => {
+                            ret = Some(Value::List(list));
+                            state = State::Value;
+                        }
+                        Some(Value::List(mut l)) => {
+                            l.push(Value::List(list));
+                            stack.push(Value::List(l));
+                            state = State::ListValue;
+                        }
+                        Some(key) => match stack.pop().unwrap() {
+                            Value::Map(mut map) => {
+                                map.insert(key.to_key().unwrap(), Value::List(list));
+                                stack.push(Value::Map(map));
+                                state = State::MapValue
+                            }
+                            _ => panic!("sh"),
+                        }
+                    }
+                    _ => panic!("sh"),
+                }
+            };
+        }
+        match ret {
+            Some(v) => Ok(v),
+            None => Err(ZishError::Description("Can't find a zish value in the document.".to_string())),
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -135,7 +715,7 @@ pub fn from_reader<R>(mut r: R) -> Result<Value, ZishError>  where R: Read {
                 format!("Trouble reading from file: {}.", e))),
         _ => (),
     }
-    from_string(&contents)
+    Value::from_str(&contents)
 }
 
 pub fn to_writer<W>(obj: &Value, w: &mut W) -> Result<(), ZishError> where W: Write {
@@ -160,516 +740,6 @@ enum State {
     ListComma,
 }
 
-pub fn from_string(zish_str: &str) -> Result<Value, ZishError> {
-    let tokens = match lexer::lex(zish_str) {
-        Ok(t) => t,
-        Err(e) => return Err(e),
-    };
-
-    let mut stack: Vec<Value> = Vec::new();
-    let mut state: State = State::Start;
-    let mut ret: Option<Value> = None;
-
-    for token in tokens.into_iter() {
-        match (state, token) {
-            (State::Start, Token::Finish) => {
-                return Err(ZishError::Description(
-                    "There is no Zish value to parse.".to_string(),
-                ));
-            }
-            (State::Start, Token::StartMap(_)) => {
-                state = State::StartMap;
-                stack.push(Value::Map(HashMap::new()));
-            }
-            (State::Start, Token::FinishMap(location)) => {
-                return Err(ZishError::Location(
-                    "Found a '}', but there isn't an open map.".to_string(),
-                    location,
-                ));
-            }
-            (State::Start, Token::Colon(location)) => {
-                return Err(ZishError::Location(
-                    "Found a ':', but there isn't an open map.".to_string(),
-                    location,
-                ));
-            }
-            (State::Start, Token::Comma(location)) => {
-                return Err(ZishError::Location(
-                    "Found a ',', outside a list or map.".to_string(),
-                    location,
-                ));
-            }
-            (State::Start, Token::StartList(_)) => {
-                state = State::StartList;
-                stack.push(Value::List(Vec::new()));
-            }
-            (State::Start, Token::FinishList(location)) => {
-                return Err(ZishError::Location(
-                    "Found a ']', but there's no list to close.".to_string(),
-                    location,
-                ));
-            }
-            (State::Start, Token::Primitive(_, x)) => {
-                ret = Some(x.into_value());
-                state = State::Value;
-            }
-
-            (State::Value, Token::StartMap(location)) => return Err(ZishError::Location(
-                    "Multiple top-level Zish values aren't allowed. So you can't have a value followed by a map.".to_string(),
-                    location,
-                )),
-            (State::Value,  Token::FinishMap(location))
-                => return Err(ZishError::Location(
-                "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
-                location,
-            )),
-            (State::Value,Token::Colon(location))
-                => return Err(ZishError::Location(
-                "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
-                location,
-            )),
-           (State::Value, Token::Comma(location))
-                => return Err(ZishError::Location(
-                "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
-                location,
-            )),
-            (State::Value,Token::StartList(location))
-                => return Err(ZishError::Location(
-                "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
-                location,
-            )),
-            (State::Value,Token::FinishList(location))
-                => return Err(ZishError::Location(
-                "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
-                location,
-            )),
-            (State::Value,Token::Primitive(location, _) )
-                => return Err(ZishError::Location(
-                "Multiple top-level Zish values aren't allowed. So you can't have anything after the first value.".to_string(),
-                location,
-            )),
-            (State::Value,Token::Finish) => (),
-
-            (State::StartMap, Token::Primitive(location, PrimitiveValue::Null)) => {
-                return Err(ZishError::Location(
-                    "null can't be a key in a map.".to_string(),
-                    location,
-                ));
-            }
-            (State::StartMap, Token::Primitive(location, primitive_value)) => match stack.pop().unwrap() {
-                Value::Map(map) => {
-                    let k: Value = primitive_value.into_value();
-                    if map.contains_key(&k.to_key().unwrap()) {
-                        return Err(ZishError::Location(format!("Duplicate map keys aren't allowed: {}.", k), location));
-                    }
-                    stack.push(Value::Map(map));
-                    stack.push(k);
-                    state = State::MapKey;
-                }
-                _ => panic!("Shouldn't happen."),
-            }
-            (State::StartMap, Token::StartList(location)) => {
-                return Err(ZishError::Location(
-                    "A list can't be a key in a map.".to_string(),
-                    location,
-                ));
-            }
-            (State::StartMap, Token::StartMap(location)) => {
-                return Err(ZishError::Location(
-                    "A map can't be a key in a map.".to_string(),
-                    location,
-                ));
-            }
-            (State::StartMap, Token::FinishMap(_)) => match stack.pop() {
-                Some(Value::Map(map)) => match stack.pop() {
-                    None => {
-                        ret = Some(Value::Map(map));
-                        state = State::Value;
-                    }
-                    Some(Value::List(mut list)) => {
-                        list.push(Value::Map(HashMap::new()));
-                        stack.push(Value::List(list));
-                        state = State::ListValue;
-                    }
-                    Some(key) => match stack.pop().unwrap() {
-                        Value::Map(mut umap) => {
-                            umap.insert(key.to_key().unwrap(), Value::Map(map));
-                            stack.push(Value::Map(umap));
-                            state = State::MapValue;
-                        }
-                        _ => panic!("Should never happen."),
-                    }
-                }
-                _ => panic!("Should never happen."),
-            }
-            (State::StartMap, Token::Colon(location)) => {
-                return Err(ZishError::Location(
-                    "A map key is expected here, but instead got a ':'".to_string(),
-                    location,
-                ));
-            }
-            (State::StartMap, Token::Comma(location)) => {
-                return Err(ZishError::Location(
-                    "A map key is expected here, but instead got a ','".to_string(),
-                    location,
-                ));
-            }
-            (State::StartMap, Token::FinishList(location)) => {
-                return Err(ZishError::Location(
-                    "A map key is expected here, but instead got a ']'".to_string(),
-                    location,
-                ));
-            }
-            (State::StartMap, Token::Finish) => {
-                return Err(ZishError::Description(
-                    "Reached the end of the document before the map was closed.".to_string())
-                );
-            }
-            (State::MapKey, Token::Colon(_)) => state = State::MapColon,
-            (State::MapKey, Token::FinishMap(location)) =>
-                return Err(ZishError::Location(
-                    "A ':' is expected here, but instead found a '}'".to_string(),
-                    location,
-                )),
-            (State::MapKey, Token::Comma(location)) =>
-                return Err(ZishError::Location(
-                    "A ':' is expected here, but instead found a ','".to_string(),
-                    location,
-                )),
-            (State::MapKey, Token::Primitive(location, _)) =>
-                return Err(ZishError::Location(
-                    "A ':' is expected here, but instead found a value.".to_string(),
-                    location,
-                )),
-            (State::MapKey, Token::StartList(location)) =>
-                return Err(ZishError::Location(
-                    "A ':' is expected here, but instead found a '['.".to_string(),
-                    location,
-                )),
-            (State::MapKey, Token::FinishList(location)) => 
-                return Err(ZishError::Location(
-                    "A ':' is expected here, but got a ']' instead.".to_string(),
-                    location,
-                )),
-            (State::MapKey, Token::Finish) => 
-                return Err(ZishError::Description(
-                    "After the key, a ':' was expected, but reached the end of the document instead.".to_string())),
-            (State::MapKey, Token::StartMap(location)) =>
-                return Err(ZishError::Location(
-                    "A ':' is expected here, but got a '{' instead.".to_string(),
-                    location,
-                )),
-            (State::MapColon, Token::StartMap(_)) => { 
-                stack.push(Value::Map(HashMap::new()));
-                state = State::StartMap;
-            }
-            (State::MapColon, Token::FinishMap(location)) =>
-                return Err(ZishError::Location(
-                    "A map value is expected here, but instead found a '}'".to_string(),
-                    location,
-                )),
-            (State::MapColon, Token::Comma(location)) =>
-                return Err(ZishError::Location(
-                    "A map value is expected here, but instead found a ','".to_string(),
-                    location,
-                )),
-            (State::MapColon, Token::Colon(location)) =>
-                return Err(ZishError::Location(
-                    "A map value is expected here, but instead found another ':'".to_string(),
-                    location,
-                )),
-            (State::MapColon, Token::Primitive(location, primitive_value)) => {
-                let k: Value = stack.pop().unwrap();
-                match stack.pop().unwrap() {
-                    Value::Map(mut m) => {
-                        match m.insert(k.to_key().unwrap(), primitive_value.into_value()) {
-                            None => stack.push(Value::Map(m)),
-                            _ => return Err(ZishError::Location(format!("Duplicate map keys aren't allowed: {}", k), location)),
-                        }
-                    }
-                    _ => panic!("sh"),
-                }
-                state = State::MapValue;
-            }
-            (State::MapColon, Token::StartList(_)) =>  {
-                stack.push(Value::List(Vec::new()));
-                state = State::StartList;
-            }
-            (State::MapColon, Token::FinishList(location)) => 
-                return Err(ZishError::Location(
-                    "A value is expected here, but got a ']' instead.".to_string(),
-                    location,
-                )),
-            (State::MapColon, Token::Finish) => 
-                return Err(ZishError::Description(
-                    "A value is expected here, but reached the end of the document instead.".to_string()
-                )),
-            (State::MapValue, Token::Primitive(location, _)) => 
-                return Err(ZishError::Location(
-                    "A ',' or '}' is expected here, but got a value instead.".to_string(),
-                    location,
-                )),
-            (State::MapValue, Token::StartMap(location)) => 
-                return Err(ZishError::Location(
-                    "A ',' or '}' is expected here, but got a '{' instead.".to_string(),
-                    location,
-                )),
-            (State::MapValue, Token::FinishMap(_)) => match stack.pop().unwrap() {
-                Value::Map(map) => match stack.pop() {
-                    None => {
-                        state = State::Value;
-                        ret = Some(Value::Map(map));
-                    }
-                    Some(Value::List(mut list)) => {
-                        list.push(Value::Map(map));
-                        state = State::ListValue;
-                    }
-                    Some(key) => match stack.pop().unwrap() {
-                        Value::Map(mut umap) => {
-                            umap.insert(key.to_key().unwrap(), Value::Map(map));
-                            stack.push(Value::Map(umap));
-                            state = State::MapValue;
-                        }
-                        _ => panic!("sh"),
-                    }
-                }
-                _ => panic!("{:?}", stack),
-            }
-            (State::MapValue, Token::Colon(location)) => 
-                return Err(ZishError::Location(
-                    "A ',' or '}' is expected here, but got a ':' instead.".to_string(),
-                    location,
-                )),
-            (State::MapValue, Token::Comma(_)) => state = State::MapComma,
-            (State::MapValue, Token::StartList(location)) => 
-                return Err(ZishError::Location(
-                    "A ',' or '}' is expected here, but got a '[' instead.".to_string(),
-                    location,
-                )),
-            (State::MapValue, Token::FinishList(location)) => 
-                return Err(ZishError::Location(
-                    "A ',' or '}' is expected here, but got a ']' instead.".to_string(),
-                    location,
-                )),
-            (State::MapValue, Token::Finish) => 
-                return Err(ZishError::Description(
-                    "A ',' or '}' is expected here, but reached the end of the document instead.".to_string(),
-                )),
-            (State::MapComma, Token::Colon(location)) => 
-                return Err(ZishError::Location(
-                    "A key is expected here, but got a ':' instead.".to_string(),
-                    location,
-                )),
-            (State::MapComma, Token::StartMap(location)) => 
-                return Err(ZishError::Location(
-                    "A key is expected here, but got a '{' instead. A map can't be a key.".to_string(),
-                    location,
-                )),
-            (State::MapComma, Token::FinishMap(location)) => 
-                return Err(ZishError::Location(
-                    "A key is expected here, but got a '}' instead. A map can't be a key.".to_string(),
-                    location,
-                )),
-            (State::MapComma, Token::Comma(location)) => 
-                return Err(ZishError::Location(
-                    "A key is expected here, but got a ',' instead.".to_string(),
-                    location,
-                )),
-            (State::MapComma, Token::StartList(location)) => 
-                return Err(ZishError::Location(
-                    "A key is expected here, but got a '[' instead. A list can't be a key.".to_string(),
-                    location,
-                )),
-            (State::MapComma, Token::FinishList(location)) => 
-                return Err(ZishError::Location(
-                    "A key is expected here, but got a ']' instead.".to_string(),
-                    location,
-                )),
-            (State::MapComma, Token::Primitive(location, PrimitiveValue::Null)) => {
-                return Err(ZishError::Location(
-                    "A null can't be used as a map key.".to_string(),
-                    location,
-                ));
-            }
-            (State::MapComma, Token::Primitive(_, primitive_value)) => {
-                stack.push(primitive_value.into_value());
-                state = State::MapKey;
-            }
-            (State::MapComma, Token::Finish) => 
-                return Err(ZishError::Description(
-                    "A key is expected here, but reached the end of the document instead.".to_string()
-                )),
-            (State::StartList, Token::FinishList(_)) => match stack.pop().unwrap() {
-                Value::List(list) => match stack.pop() {
-                    None => {
-                        ret = Some(Value::List(list));
-                        state = State::Value;
-                    }
-                    Some(Value::List(mut ulist)) => {
-                        ulist.push(Value::List(list));
-                        stack.push(Value::List(ulist));
-                        state = State::ListValue;
-                    }
-                    Some(key) => match stack.pop().unwrap() {
-                        Value::Map(mut map) => {
-                            map.insert(key.to_key().unwrap(), Value::List(list));
-                            stack.push(Value::Map(map));
-                            state = State::MapValue;
-                        }
-                        _ => panic!("sh"),
-                    }
-                }
-                _ => panic!("sh"),
-            }
-            (State::StartList, Token::Primitive(_, x)) => match stack.pop().unwrap() {
-                Value::List(mut list) => {
-                    list.push(x.into_value());
-                    stack.push(Value::List(list));
-                    state = State::ListValue;
-                }
-                _ => panic!("expected a list here."),
-            }
-            (State::StartList, Token::StartList(_)) =>
-                stack.push(Value::List(Vec::new())),
-            (State::StartList, Token::StartMap(_)) => {
-                    stack.push(Value::Map(HashMap::new()));
-                    state = State::StartMap;
-            }
-            (State::StartList, Token::FinishMap(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a value here, but got '}'.".to_string(),
-                    location,
-                ));
-            }
-            (State::StartList, Token::Colon(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a value here, but got ':'.".to_string(),
-                    location,
-                ));
-            }
-            (State::StartList, Token::Comma(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a value here, but got ','.".to_string(),
-                    location,
-                ));
-            }
-            (State::StartList, Token::Finish) => {
-                return Err(ZishError::Description(
-                    "The document finished before the list was closed.".to_string(),
-                ));
-            }
-            (State::ListValue, Token::Finish) => {
-                return Err(ZishError::Description(
-                            "Expected a ',' or a ']', but reached the end of the document instead."
-                                .to_string()
-                        ));
-            }
-            (State::ListValue, Token::Comma(_))  => state = State::ListComma,
-            (State::ListValue, Token::FinishList(_) )=> match stack.pop().unwrap() {
-                Value::List(list) => match stack.pop() {
-                    None => {
-                        ret = Some(Value::List(list));
-                        state = State::Value;
-                    }
-                    Some(Value::List(mut l)) => {
-                        l.push(Value::List(list));
-                        stack.push(Value::List(l));
-                    }
-                    Some(key) => match stack.pop().unwrap() {
-                        Value::Map(mut map) => {
-                            map.insert(key.to_key().unwrap(), Value::List(list));
-                            stack.push(Value::Map(map));
-                        }
-                        _ => panic!("sh"),
-                    }
-                }
-                _ => panic!("sh"),
-            }
-            (State::ListValue, Token::FinishMap(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a ',' or a ']' here, but got '}'".to_string(),
-                    location,
-                ));
-            }
-            (State::ListValue, Token::Colon(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a ',' or a ']' here, but got ':'".to_string(),
-                    location,
-                ));
-            }
-            (State::ListValue, Token::StartMap(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a ',' or a ']' here, but got '{'".to_string(),
-                    location,
-                ));
-            }
-            (State::ListValue, Token::StartList(location)) => {
-                return Err(ZishError::Location(
-                    "Expected a ',' or a ']' here, but got '['".to_string(),
-                    location,
-                ));
-            }
-            (State::ListValue, Token::Primitive(location, _)) => {
-                return Err(ZishError::Location(
-                    "Expected a ',' or a ']' here, but got a value.".to_string(),
-                    location,
-                ));
-            }
-            (State::ListComma, Token::StartMap(_))  => {
-                let map: HashMap<Key, Value> = HashMap::new();
-                stack.push(Value::Map(map)); 
-                state = State::StartMap;
-            }
-            (State::ListComma, Token::FinishMap(location))  => {
-                return Err(ZishError::Location(
-                    "Expected a value here, but found a '}'.".to_string(),
-                    location,
-                ));
-            }
-            (State::ListComma, Token::Colon(location))  => {
-                return Err(ZishError::Location(
-                    "Expected a value here, but found a ':'.".to_string(),
-                    location,
-                ));
-            }
-            (State::ListComma, Token::Comma(location))  => {
-                return Err(ZishError::Location(
-                    "Expected a value here, but got a ','.".to_string(),
-                    location,
-                ));
-            }
-            (State::ListComma, Token::StartList(_))  => {
-                let list: Vec<Value> = Vec::new();
-                stack.push(Value::List(list)); 
-                state = State::StartList;
-            }
-            (State::ListComma, Token::Primitive(_, val))  => match stack.pop().unwrap() {
-                Value::List(mut list) => {
-                    list.push(val.into_value());
-                    stack.push(Value::List(list));
-                    state = State::ListValue;
-                }
-                _ => panic!("expected a list here."),
-            }
-            (State::ListComma, Token::FinishList(location))  => {
-                return Err(ZishError::Location(
-                    "Trailing commas aren't allowed in Zish.".to_string(),
-                    location,
-                ));
-            }
-            (State::ListComma, Token::Finish)  => {
-                return Err(ZishError::Description(
-                    "Expected a value, but reached the end of the document.".to_string())
-                );
-            }
-        };
-    }
-    match ret {
-        Some(v) => Ok(v),
-        None => Err(ZishError::Description("Can't find a zish value in the document.".to_string())),
-    }
-}
-
 pub fn to_string(obj: &Value) -> String {
     dump(obj, "")
 }
@@ -690,12 +760,12 @@ fn dump_map(map: &HashMap<Key, Value>, indent: &str) -> String {
     keys.sort();
     for k in keys {
         let v: &Value = map.get(k).unwrap();
-        items.push(format!("{}{}: {}", pref, k.to_value(), dump(v, &new_indent)));
+        items.push(format!("{}{}: {},", pref, k.to_value(), dump(v, &new_indent)));
     }
 
     match items.len() {
         0 => "{}".to_string(),
-        _ => format!("{{{}\n{}}}", items.join(","), indent),
+        _ => format!("{{{}\n{}}}", items.join(""), indent),
     }
 }
 
@@ -708,9 +778,9 @@ fn dump_list(list: &Vec<Value>, indent: &str) -> String {
             pref.push_str(&new_indent);
             let mut strs: Vec<String> = Vec::new();
             for v in list {
-                strs.push(format!("{}{}", pref, dump(v, &new_indent)));
+                strs.push(format!("{}{},", pref, dump(v, &new_indent)));
             }
-            let b: String = strs.join(",");
+            let b: String = strs.join("");
             format!("[{}\n{}]", b, indent)
         }
     }
@@ -723,6 +793,8 @@ mod tests {
     use chrono::{DateTime, Utc, TimeZone};
     use bigdecimal::BigDecimal;
     use std::str::FromStr;
+    use std::iter::FromIterator;
+    use std::array::IntoIter;
 
     #[test]
     fn test_from_reader() {
@@ -753,6 +825,10 @@ fn test_dump() {
         nested_map.insert(Key::String("center".to_string()), Value::Map(nested_map_1));
         nested_map.insert(Key::String("radius".to_string()), Value::Integer(3));
 
+        // { "x": 42 }
+        let mut map_a: HashMap<Key, Value> = HashMap::new();
+        map_a.insert(Key::String("x".to_string()), Value::Integer(42));
+
         // "{ \"first\" : \"Tom\" , \"last\": \"Riddle\" }",
         let mut map_b: HashMap<Key, Value> = HashMap::new();
         map_b.insert(Key::String("first".to_string()), Value::String("Tom".to_string()));
@@ -761,6 +837,10 @@ fn test_dump() {
         // { "":42 }
         let mut map_c: HashMap<Key, Value> = HashMap::new();
         map_c.insert(Key::String("".to_string()), Value::Integer(42));
+
+        // { "x": [] }
+        let mut map_d: HashMap<Key, Value> = HashMap::new();
+        map_d.insert(Key::String("x".to_string()), Value::List(vec![Value::Integer(42)]));
 
         let tests: Vec<(&str, Result<Value, ZishError>)> = vec![
             //
@@ -1256,12 +1336,16 @@ fn test_dump() {
                     "After the key, a ':' was expected, but reached the end of the document instead.".to_string()))
             ),
 
-            // Trailing comma is invalid in Zish (like JSON)
+            // Trailing comma is valid in Zish (unlike JSON)
             (
-                "{ x:1, }",
-                Err(ZishError::Location(
-                        "The value x is not recognized.".to_string(),
-                        Location { line: 1, character: 4}))
+                "{ \"x\":42, }",
+                Ok(Value::Map(HashMap::<_, _>::from_iter(IntoIter::new([(Key::String("x".to_string()), Value::Integer(42))]))))
+            ),
+
+            // Trailing comma is valid in Zish (unlike JSON)
+            (
+                "{ \"x\":[1,], }",
+                Ok(Value::Map(HashMap::<_, _>::from_iter(IntoIter::new([(Key::String("x".to_string()), Value::List(vec![Value::Integer(1)]))]))))
             ),
 
             // A map value containing a field with an empty name
@@ -1324,12 +1408,10 @@ fn test_dump() {
                 Ok(Value::List(vec![Value::String("a".to_string()), Value::List(vec![Value::String("b".to_string())])]))
             ),
 
-            // Trailing comma is invalid in Zish (like JSON)
+            // Trailing comma is valid in Zish (unlike JSON)
             (
                 "[ 1.2, ]",
-                Err(ZishError::Location(
-                    "Trailing commas aren't allowed in Zish.".to_string(),
-                    Location { line: 1, character: 8}))
+                Ok(Value::List(vec![Value::Decimal(BigDecimal::from_str("1.2").unwrap())])),
             ),
 
             // ERROR: missing element between commas
@@ -1398,7 +1480,7 @@ fn test_dump() {
     fn test_dump_map() {
         let mut map: HashMap<Key, Value> = HashMap::new();
         map.insert(Key::Integer(3), Value::Integer(4));
-        assert_eq!(dump_map(&map, ""), "{\n  3: 4\n}");
+        assert_eq!(dump_map(&map, ""), "{\n  3: 4,\n}");
     }
 
     #[test]
@@ -1436,11 +1518,11 @@ fn test_dump() {
   \"tags\": [
     \"russian\",
     \"novel\",
-    \"19th centuary\"
+    \"19th centuary\",
   ],
   \"title\": \"A Hero of Our Time\",
   \"weight\": 6.88,
-  \"would_recommend\": true
+  \"would_recommend\": true,
 }"),
 
             (Value::List(Vec::new()), "[]"),
@@ -1451,7 +1533,7 @@ fn test_dump() {
 
             (Value::Map(map_2), "{
   \"three\": \"four\",
-  1: 2
+  1: 2,
 }")
         ];
         for (res, zish_str) in tests {
